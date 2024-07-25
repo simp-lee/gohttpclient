@@ -1,5 +1,9 @@
 # GoHTTPClient
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/simp-lee/gohttpclient)](https://goreportcard.com/report/github.com/simp-lee/gohttpclient)
+[![GoDoc](https://godoc.org/github.com/simp-lee/gohttpclient?status.svg)](https://godoc.org/github.com/simp-lee/gohttpclient)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 `gohttpclient` is a powerful and flexible HTTP client library for Go, designed to enhance and extend the functionality of the standard `net/http` client. It provides a robust set of features including interceptors, rate limiting, automatic retries, and detailed metrics tracking, making it ideal for building resilient and observable network applications.
 
 ## Table of Contents
