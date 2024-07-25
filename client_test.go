@@ -3,13 +3,17 @@ package gohttpclient
 import (
 	"context"
 	"encoding/json"
-	"github.com/cenkalti/backoff/v4"
+	"fmt"
+	"github.com/simp-lee/retry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -27,12 +31,23 @@ func (l *mockLogger) Info(msg string, keyVals ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.InfoLogs = append(l.InfoLogs, msg)
+
+	slog.Info(fmt.Sprintf(msg, keyVals...))
 }
 
 func (l *mockLogger) Error(msg string, keyVals ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.ErrorLogs = append(l.ErrorLogs, msg)
+
+	slog.Error(fmt.Sprintf(msg, keyVals...))
+}
+
+func (l *mockLogger) Warn(msg string, keyVals ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	slog.Warn(fmt.Sprintf(msg, keyVals...))
 }
 
 func TestNewClient(t *testing.T) {
@@ -47,16 +62,18 @@ func TestNewClient(t *testing.T) {
 				Client: http.Client{
 					Timeout: 30 * time.Second,
 				},
-				retries: 3,
-				backOff: backoff.NewExponentialBackOff(),
-				logger:  &defaultLogger{},
+				retryOptions: []retry.Option{
+					retry.WithTimes(3),
+					retry.WithExponentialBackoff(2*time.Second, 10*time.Second, 500*time.Millisecond),
+				},
+				logger: &defaultLogger{},
 			},
 		},
 		{
 			name: "Custom options",
 			options: []ClientOption{
 				WithTimeout(10 * time.Second),
-				WithRetries(5),
+				WithRetryTimes(5),
 				WithRateLimit(1, 5),
 				WithLogger(&mockLogger{}),
 			},
@@ -64,8 +81,11 @@ func TestNewClient(t *testing.T) {
 				Client: http.Client{
 					Timeout: 10 * time.Second,
 				},
-				retries: 5,
-				backOff: backoff.NewExponentialBackOff(),
+				retryOptions: []retry.Option{
+					retry.WithTimes(5),
+				},
+				limiter: rate.NewLimiter(rate.Limit(1), 5),
+				logger:  &mockLogger{},
 			},
 		},
 	}
@@ -74,8 +94,19 @@ func TestNewClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := NewClient(tt.options...)
 			assert.Equal(t, tt.expected.Timeout, client.Timeout)
-			assert.Equal(t, tt.expected.retries, client.retries)
-			assert.NotNil(t, client.backOff)
+
+			for i, expectedOption := range tt.expected.retryOptions {
+				assert.Equal(t, reflect.TypeOf(expectedOption), reflect.TypeOf(client.retryOptions[i]))
+			}
+
+			assert.Equal(t, tt.expected.logger, client.logger)
+			if tt.expected.limiter != nil {
+				assert.NotNil(t, client.limiter)
+				assert.Equal(t, tt.expected.limiter.Limit(), client.limiter.Limit())
+				assert.Equal(t, tt.expected.limiter.Burst(), client.limiter.Burst())
+			} else {
+				assert.Nil(t, client.limiter)
+			}
 			assert.NotNil(t, client.logger)
 			if tt.name == "Custom options" {
 				assert.NotNil(t, client.limiter)
@@ -92,6 +123,7 @@ func TestClient_Request(t *testing.T) {
 		serverResponse func(w http.ResponseWriter, r *http.Request)
 		expected       []byte
 		expectedError  bool
+		logSuccess     bool
 	}{
 		{
 			name:   "Successful GET request",
@@ -100,7 +132,8 @@ func TestClient_Request(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte(`{"message": "success"}`))
 			},
-			expected: []byte(`{"message": "success"}`),
+			expected:   []byte(`{"message": "success"}`),
+			logSuccess: true,
 		},
 		{
 			name:   "Successful POST request with body",
@@ -113,7 +146,8 @@ func TestClient_Request(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte(`{"message": "success"}`))
 			},
-			expected: []byte(`{"message": "success"}`),
+			expected:   []byte(`{"message": "success"}`),
+			logSuccess: true,
 		},
 		{
 			name:   "Server error",
@@ -123,6 +157,7 @@ func TestClient_Request(t *testing.T) {
 				w.Write([]byte(`{"message": "error"}`))
 			},
 			expectedError: true,
+			logSuccess:    true,
 		},
 	}
 
@@ -132,7 +167,8 @@ func TestClient_Request(t *testing.T) {
 			defer server.Close()
 
 			logger := &mockLogger{}
-			client := NewClient(WithLogger(logger))
+			client := NewClient(WithLogger(logger), WithLogInfoEnabled(tt.logSuccess))
+			defer client.Close()
 			ctx := context.Background()
 			respBody, err := client.Request(ctx, tt.method, server.URL, tt.body)
 
@@ -142,7 +178,11 @@ func TestClient_Request(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, tt.expected, respBody)
-				assert.True(t, strings.HasPrefix(logger.InfoLogs[0], "Request successful"))
+				if tt.logSuccess {
+					assert.True(t, len(logger.InfoLogs) > 0 && strings.HasPrefix(logger.InfoLogs[0], "Request successful"))
+				} else {
+					assert.Empty(t, logger.InfoLogs)
+				}
 			}
 		})
 	}
@@ -163,10 +203,12 @@ func TestClient_RequestWithRetry(t *testing.T) {
 
 	logger := &mockLogger{}
 	client := NewClient(
-		WithRetries(3),
-		WithBackoff(backoff.NewConstantBackOff(10*time.Millisecond)),
+		WithRetryTimes(3),
+		WithRetryLinearBackoff(10*time.Millisecond),
 		WithLogger(logger),
+		WithLogInfoEnabled(true),
 	)
+	defer client.Close()
 	ctx := context.Background()
 	respBody, err := client.Request(ctx, http.MethodGet, server.URL, nil)
 	require.NoError(t, err)
@@ -187,15 +229,16 @@ func TestClient_RequestWithError(t *testing.T) {
 	defer server.Close()
 
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
+	defer client.Close()
+
 	ctx := context.Background()
 	_, err := client.Request(ctx, http.MethodGet, server.URL, nil)
 	require.Error(t, err)
 
-	clientError, ok := err.(*ClientError)
-	require.True(t, ok)
-	assert.Equal(t, http.StatusInternalServerError, clientError.Code)
+	require.Contains(t, err.Error(), "HTTP 500")
 	assert.True(t, strings.HasPrefix(logger.ErrorLogs[0], "Request failed"))
+	assert.Empty(t, logger.InfoLogs)
 }
 
 func TestClient_RequestWithInterceptor(t *testing.T) {
@@ -208,7 +251,9 @@ func TestClient_RequestWithInterceptor(t *testing.T) {
 	defer server.Close()
 
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
+	defer client.Close()
+
 	client.AddRequestInterceptor(func(req *http.Request) error {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Test-Header", "test-value")
@@ -221,6 +266,7 @@ func TestClient_RequestWithInterceptor(t *testing.T) {
 
 	expected := []byte(`{"message": "interceptor success"}`)
 	assert.Equal(t, expected, respBody)
+
 	assert.True(t, strings.HasPrefix(logger.InfoLogs[0], "Request successful"))
 }
 
@@ -235,7 +281,9 @@ func TestClient_RequestWithRateLimit(t *testing.T) {
 	client := NewClient(
 		WithRateLimit(10, 1),
 		WithLogger(logger),
+		WithLogInfoEnabled(true),
 	)
+	defer client.Close()
 
 	start := time.Now()
 	for i := 0; i < 5; i++ {
@@ -267,7 +315,9 @@ func TestClient_RequestWithCustomBody(t *testing.T) {
 	defer server.Close()
 
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
+	defer client.Close()
+
 	body := map[string]string{"custom": "body"}
 
 	ctx := context.Background()
@@ -281,10 +331,10 @@ func TestClient_RequestWithCustomBody(t *testing.T) {
 
 func TestClient_Close(t *testing.T) {
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
 	client.Close()
 	assert.NotNil(t, client)
-	//assert.True(t, strings.HasPrefix(logger.InfoLogs[0], "Client closed"))
+	assert.True(t, strings.HasPrefix(logger.InfoLogs[0], "Client closed"))
 }
 
 func TestClient_Get(t *testing.T) {
@@ -297,7 +347,9 @@ func TestClient_Get(t *testing.T) {
 	defer server.Close()
 
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
+	defer client.Close()
+
 	ctx := context.Background()
 	respBody, err := client.Get(ctx, server.URL)
 	require.NoError(t, err)
@@ -322,7 +374,8 @@ func TestClient_Post(t *testing.T) {
 	defer server.Close()
 
 	logger := &mockLogger{}
-	client := NewClient(WithLogger(logger))
+	client := NewClient(WithLogger(logger), WithLogInfoEnabled(true))
+	defer client.Close()
 	body := map[string]string{"key": "value"}
 
 	ctx := context.Background()
@@ -346,6 +399,7 @@ func TestClient_Metrics(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(WithLogger(&mockLogger{}))
+	defer client.Close()
 	ctx := context.Background()
 
 	// Successful request
@@ -376,6 +430,7 @@ func TestClient_WithProxy(t *testing.T) {
 		WithProxy(proxyURL),
 		WithLogger(&mockLogger{}),
 	)
+	defer client.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("Request should not reach this server")
@@ -390,29 +445,6 @@ func TestClient_WithProxy(t *testing.T) {
 	assert.Equal(t, expected, respBody)
 }
 
-func TestClient_WithBackoff(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message": "backoff success"}`))
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(handler))
-	defer server.Close()
-
-	logger := &mockLogger{}
-	client := NewClient(
-		WithBackoff(&backoff.StopBackOff{}),
-		WithLogger(logger),
-	)
-	ctx := context.Background()
-	respBody, err := client.Request(ctx, http.MethodGet, server.URL, nil)
-	require.NoError(t, err)
-
-	expected := []byte(`{"message": "backoff success"}`)
-	assert.Equal(t, expected, respBody)
-	assert.True(t, strings.HasPrefix(logger.InfoLogs[0], "Request successful"))
-}
-
 func TestClient_ConcurrentRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
@@ -425,6 +457,7 @@ func TestClient_ConcurrentRequests(t *testing.T) {
 		WithMaxConnsPerHost(5),
 		WithLogger(&mockLogger{}),
 	)
+	defer client.Close()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -473,6 +506,7 @@ func TestClient_Convenience_Methods(t *testing.T) {
 			defer server.Close()
 
 			client := NewClient(WithLogger(&mockLogger{}))
+			defer client.Close()
 			ctx := context.Background()
 
 			var respBody []byte

@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/cenkalti/backoff/v4"
+	"github.com/simp-lee/retry"
 	"golang.org/x/time/rate"
 	"io"
 	"net"
@@ -40,15 +40,15 @@ type Client struct {
 	cancelFunc           context.CancelFunc
 	limiter              *rate.Limiter
 	logger               Logger
-	retries              int
-	backOff              backoff.BackOff
+	retryOptions         []retry.Option
+	logInfoEnabled       bool
 }
 
 // Metrics holds metrics for the client
 type Metrics struct {
+	TotalLatency int64 // in nanoseconds
 	RequestCount int64
 	ErrorCount   int64
-	TotalLatency int64 // in nanoseconds
 }
 
 // RequestInterceptor is a function that can modify requests before they are sent
@@ -61,6 +61,7 @@ type ResponseInterceptor func(*http.Response) error
 type Logger interface {
 	Info(msg string, keyVals ...interface{})
 	Error(msg string, keyVals ...interface{})
+	Warn(msg string, keyVals ...interface{})
 }
 
 // ClientOption is a function type for client configuration
@@ -74,19 +75,45 @@ func WithTimeout(timeout time.Duration) ClientOption {
 	}
 }
 
-// WithRetries sets the number of retries for failed requests
-// Retries are performed using exponential backoff
-func WithRetries(retries int) ClientOption {
+// WithRetryTimes sets the number of retries for failed requests.
+func WithRetryTimes(maxRetries int) ClientOption {
 	return func(c *Client) {
-		c.retries = retries
+		c.retryOptions = append(c.retryOptions, retry.WithTimes(maxRetries))
 	}
 }
 
-// WithBackoff sets a custom backoff strategy for retries
-// Use this if the default exponential backoff doesn't suit your needs
-func WithBackoff(b backoff.BackOff) ClientOption {
+// WithRetryCustomBackoff sets a custom backoff strategy for retries
+func WithRetryCustomBackoff(backoff retry.Backoff) ClientOption {
 	return func(c *Client) {
-		c.backOff = b
+		c.retryOptions = append(c.retryOptions, retry.WithCustomBackoff(backoff))
+	}
+}
+
+// WithRetryLinearBackoff sets a linear backoff strategy for retries
+func WithRetryLinearBackoff(interval time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryOptions = append(c.retryOptions, retry.WithLinearBackoff(interval))
+	}
+}
+
+// WithRetryConstantBackoff sets a constant backoff strategy for retries
+func WithRetryConstantBackoff(interval time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryOptions = append(c.retryOptions, retry.WithConstantBackoff(interval))
+	}
+}
+
+// WithRetryRandomIntervalBackoff sets a random interval backoff strategy for retries
+func WithRetryRandomIntervalBackoff(minInterval, maxInterval time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryOptions = append(c.retryOptions, retry.WithRandomIntervalBackoff(minInterval, maxInterval))
+	}
+}
+
+// WithRetryExponentialBackoff sets an exponential backoff strategy with jitter for retries
+func WithRetryExponentialBackoff(initialInterval, maxInterval, maxJitter time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryOptions = append(c.retryOptions, retry.WithExponentialBackoff(initialInterval, maxInterval, maxJitter))
 	}
 }
 
@@ -103,6 +130,9 @@ func WithRateLimit(rps float64, burst int) ClientOption {
 func WithLogger(logger Logger) ClientOption {
 	return func(c *Client) {
 		c.logger = logger
+		c.retryOptions = append(c.retryOptions, retry.WithLogger(func(format string, args ...interface{}) {
+			logger.Warn(format, args...)
+		}))
 	}
 }
 
@@ -180,6 +210,20 @@ func WithProxy(proxyURL *url.URL) ClientOption {
 	}
 }
 
+// WithCustomTransport sets custom transport for the client
+func WithCustomTransport(transport *http.Transport) ClientOption {
+	return func(c *Client) {
+		c.Transport = transport
+	}
+}
+
+// WithLogInfoEnabled sets whether Info logging is enabled for the client
+func WithLogInfoEnabled(enabled bool) ClientOption {
+	return func(c *Client) {
+		c.logInfoEnabled = enabled
+	}
+}
+
 // NewClient creates a new Client with the given options
 func NewClient(options ...ClientOption) *Client {
 	baseContext, cancelFunc := context.WithCancel(context.Background())
@@ -212,8 +256,11 @@ func NewClient(options ...ClientOption) *Client {
 		baseContext: baseContext,
 		cancelFunc:  cancelFunc,
 		logger:      &defaultLogger{},
-		retries:     3,
-		backOff:     backoff.NewExponentialBackOff(),
+		retryOptions: []retry.Option{
+			retry.WithTimes(3),
+			retry.WithExponentialBackoff(2*time.Second, 10*time.Second, 500*time.Millisecond),
+		},
+		logInfoEnabled: false,
 	}
 
 	// Apply custom options
@@ -239,29 +286,17 @@ func (c *Client) AddResponseInterceptor(interceptor ResponseInterceptor) {
 	c.responseInterceptors = append(c.responseInterceptors, interceptor)
 }
 
-// Request makes an HTTP request
+// Request makes an HTTP request with the given method, URL, and body.
+// It applies all request and response interceptors, and handles retries according to the client's retry options.
 func (c *Client) Request(ctx context.Context, method, url string, body interface{}) ([]byte, error) {
 	start := time.Now()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var bodyReader io.Reader
-	if body != nil {
-		switch v := body.(type) {
-		case io.Reader:
-			bodyReader = v
-		case []byte:
-			bodyReader = bytes.NewReader(v)
-		case string:
-			bodyReader = bytes.NewReader([]byte(v))
-		default:
-			jsonBody, err := json.Marshal(body)
-			if err != nil {
-				return nil, &ClientError{Op: "marshal request body", Err: err}
-			}
-			bodyReader = bytes.NewReader(jsonBody)
-		}
+	bodyReader, err := createBodyReader(body)
+	if err != nil {
+		return nil, &ClientError{Op: "marshal request body", Err: err}
 	}
 
 	var respBody []byte
@@ -322,15 +357,42 @@ func (c *Client) Request(ctx context.Context, method, url string, body interface
 		return nil
 	}
 
-	err := backoff.Retry(operation, backoff.WithMaxRetries(c.backOff, uint64(c.retries)))
+	// Add context to retry options
+	retryOptions := append(c.retryOptions, retry.WithContext(ctx))
+
+	err = retry.Do(operation, retryOptions...)
 	c.collectMetrics(start, err)
 	if err != nil {
 		c.logger.Error("Request failed", "error", err, "method", method, "url", url)
 		return nil, err
 	}
 
-	c.logger.Info("Request successful", "method", method, "url", url)
+	if c.logInfoEnabled {
+		c.logger.Info("Request successful", "method", method, "url", url)
+	}
+
 	return respBody, nil
+}
+
+// createBodyReader creates a reader for the request body
+func createBodyReader(body interface{}) (io.Reader, error) {
+	if body == nil {
+		return nil, nil
+	}
+	switch v := body.(type) {
+	case io.Reader:
+		return v, nil
+	case []byte:
+		return bytes.NewReader(v), nil
+	case string:
+		return bytes.NewReader([]byte(v)), nil
+	default:
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		return bytes.NewReader(jsonBody), nil
+	}
 }
 
 // collectMetrics updates the client's metrics
@@ -367,6 +429,9 @@ func (c *Client) Delete(ctx context.Context, url string) ([]byte, error) {
 func (c *Client) Close() {
 	c.cancelFunc()
 	c.CloseIdleConnections()
+	if c.logInfoEnabled {
+		c.logger.Info("Client closed")
+	}
 }
 
 // GetMetrics returns the current metrics
@@ -387,4 +452,8 @@ func (l *defaultLogger) Info(msg string, keyVals ...interface{}) {
 
 func (l *defaultLogger) Error(msg string, keyVals ...interface{}) {
 	fmt.Printf("ERROR: %s %v\n", msg, keyVals)
+}
+
+func (l *defaultLogger) Warn(msg string, keyVals ...interface{}) {
+	fmt.Printf("WARN: %s %v\n", msg, keyVals)
 }
